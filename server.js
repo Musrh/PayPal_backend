@@ -1,4 +1,4 @@
-// server.js - PayPal + Firestore
+// server.js - PayPal + Firestore sécurisé
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -41,7 +41,7 @@ const paypalClient = new paypal.core.PayPalHttpClient(paypalEnv);
 // ================= CREATE PAYPAL ORDER =================
 app.post("/create-paypal-order", async (req, res) => {
   try {
-    const { items } = req.body;
+    const { items, email, adresseLivraison } = req.body;
     if (!items || !items.length) return res.status(400).json({ error: "Aucun item fourni" });
 
     const total = items.reduce((sum, i) => sum + i.prix * i.quantity, 0).toFixed(2);
@@ -62,6 +62,15 @@ app.post("/create-paypal-order", async (req, res) => {
     const order = await paypalClient.execute(request);
     const approveUrl = order.result.links.find(l => l.rel === "approve").href;
 
+    // 🔹 Enregistrer temporairement la commande
+    await db.collection("pendingOrders").doc(order.result.id).set({
+      email,
+      items,
+      adresse: adresseLivraison,
+      montant: total,
+      createdAt: new Date(),
+    });
+
     res.json({ id: order.result.id, url: approveUrl });
   } catch (err) {
     console.error("❌ PayPal create order error:", err);
@@ -72,7 +81,7 @@ app.post("/create-paypal-order", async (req, res) => {
 // ================= CAPTURE PAYPAL ORDER =================
 app.post("/capture-paypal-order", async (req, res) => {
   try {
-    const { orderId, email, adresseLivraison, items } = req.body;
+    const { orderId } = req.body;
     if (!orderId) return res.status(400).json({ error: "orderId manquant" });
 
     const request = new paypal.orders.OrdersCaptureRequest(orderId);
@@ -80,19 +89,28 @@ app.post("/capture-paypal-order", async (req, res) => {
     const capture = await paypalClient.execute(request);
 
     if (capture.result.status === "COMPLETED") {
-      // 🔹 Enregistrer dans Firestore
+      // 🔹 Récupérer la commande temporaire
+      const pendingSnap = await db.collection("pendingOrders").doc(orderId).get();
+      if (!pendingSnap.exists) throw new Error("Commande temporaire introuvable");
+
+      const { email, items, adresse, montant } = pendingSnap.data();
+
+      // 🔹 Enregistrer la commande finale
       await db.collection("commandes").add({
         email,
-        items: items || [],
-        montant: capture.result.purchase_units[0].payments.captures[0].amount.value,
-        adresse: adresseLivraison || "",
+        items,
+        montant,
+        adresse,
         paymentMethod: "paypal",
         orderId,
         status: "paid",
         createdAt: new Date(),
       });
 
-      console.log("✅ Commande PayPal enregistrée dans Firestore :", orderId);
+      // 🔹 Supprimer la commande temporaire
+      await db.collection("pendingOrders").doc(orderId).delete();
+
+      console.log("✅ Commande PayPal finalisée et enregistrée :", orderId);
       return res.json({ success: true });
     }
 
